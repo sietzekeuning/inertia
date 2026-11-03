@@ -1,4 +1,5 @@
 import { router } from '..'
+import { eventHandler } from '../eventHandler'
 import { fireBeforeUpdateEvent } from '../events'
 import { history } from '../history'
 import {
@@ -354,12 +355,19 @@ const landingVisit = (params: RequestParams): LandingVisit => {
   }
 }
 
+export interface LandResponseHooks {
+  keepsCurrentUrl?: (currentPageUrl: URL, responseUrl: URL) => boolean
+  queryMethodData?: (response: Page) => Page['queryMethodData']
+  onCommit?: () => void
+}
+
 // Props are merged only once the plan says it lands in that layer; a promoted response keeps its own.
 export const landResponse = async (
   response: Page,
   params: RequestParams,
   captured: BaseSnapshot,
   optimisticId: number | null = null,
+  hooks: LandResponseHooks = {},
 ): Promise<string | undefined> => {
   const target = responseTarget(currentPage.get(), response, params.all().layerId)
 
@@ -373,12 +381,30 @@ export const landResponse = async (
 
   await rememberedStateInto(response, params)
 
+  // The request may have been cancelled while the response was being prepared,
+  // for example when the user navigated back or a visit to another page committed
+  if (params.isDropped()) {
+    return undefined
+  }
+
+  // A redirect decides where the visit lands, so we compare against the page the server returned
+  const currentPageUrl = hrefToUrl(currentPage.get().url)
+  const { layerId } = params.all()
+  const layerUrl = layerId === undefined ? null : (layerAt(currentPage.get(), layerId)?.url ?? null)
+  const keepsCurrentUrl = hooks.keepsCurrentUrl?.(currentPageUrl, hrefToUrl(response.url)) ?? false
+
   params.setPreserveOptions(response)
+
+  const queryMethodData = hooks.queryMethodData?.(response)
+
+  if (queryMethodData) {
+    response.queryMethodData = queryMethodData
+  }
 
   // `preserveUrl` puts the base's url on the response, so the layer's own is held here.
   const responseUrl = pageUrl(response, params.all().url)
 
-  response.url = history.preserveUrl ? currentPage.get().url : responseUrl
+  response.url = history.preserveUrl || keepsCurrentUrl ? currentPage.get().url : responseUrl
 
   const plan = planLanding({
     response,
@@ -407,11 +433,34 @@ export const landResponse = async (
   params.all().onBeforeUpdate(landing.page)
   fireBeforeUpdateEvent(landing.page)
 
+  // A response leaves the tier it lands on when that tier gets another address: the base when it lands there, or
+  // the layer it was sent from. One that opens a layer over the base leaves the base's requests running.
+  const landedTier = landing.landedOn === undefined ? undefined : layerAt(landing.page, landing.landedOn)
+  const left: [URL, string | undefined] | null =
+    landing.landedOn === undefined
+      ? params.leavesPage(currentPageUrl, hrefToUrl(landing.page.url))
+        ? [currentPageUrl, undefined]
+        : null
+      : landing.landedOn === layerId && layerUrl !== null && landedTier?.url
+        ? params.leavesPage(hrefToUrl(layerUrl), hrefToUrl(landedTier.url))
+          ? [hrefToUrl(layerUrl), layerId]
+          : null
+        : null
+
   await currentPage.set(landing.page, {
     ...landing.set,
     viewTransition: params.all().viewTransition,
     cached: params.all().cached,
     visitId: params.all().id,
+    isCancelled: () => params.isDropped(),
+    onCommit: () => {
+      hooks.onCommit?.()
+
+      // The page is only left once it's replaced, a dropped visit leaves its requests running
+      if (left) {
+        eventHandler.fireInternalEvent('leavePage', ...left)
+      }
+    },
   })
 
   return landing.landedOn

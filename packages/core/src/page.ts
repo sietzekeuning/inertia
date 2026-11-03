@@ -21,6 +21,7 @@ import { registryClose } from './layers/handles'
 import { resolveLayers } from './layers/render'
 import { continueWalk } from './layers/walk'
 import { prefetchedRequests } from './prefetched'
+import { setPendingDeferredProps } from './propRefreshes'
 import { Scroll } from './scroll'
 import {
   Component,
@@ -45,11 +46,20 @@ const tiersOf = (page: Page): [string | undefined, Tier][] => [
 
 const pendingDeferred = new Map<string | undefined, Pick<Tier, 'deferredProps' | 'component' | 'url'>>()
 
+// Bumped on every recording, so a cancelled visit only rolls back what it recorded itself.
+let deferredRecording = 0
+
 const recordDeferredProps = (page: Page, onScreen?: Page): void => {
-  const carried = new Map(onScreen ? tiersOf(onScreen).map(([key, tier]) => [key, tier.deferredProps]) : [])
+  deferredRecording++
+
+  const carried = new Map(onScreen ? tiersOf(onScreen).map(([key, tier]) => [key, tier]) : [])
 
   for (const [key, tier] of tiersOf(page)) {
-    if (Object.keys(tier.deferredProps ?? {}).length && tier.deferredProps !== carried.get(key)) {
+    const shown = carried.get(key)
+    // A client visit copies the deferred props of the tier it replaces; those are only owed again at another url
+    const alreadyRequested = shown !== undefined && tier.deferredProps === shown.deferredProps && tier.url === shown.url
+
+    if (Object.keys(tier.deferredProps ?? {}).length && !alreadyRequested) {
       pendingDeferred.set(key, { deferredProps: tier.deferredProps, component: tier.component, url: tier.url })
     }
   }
@@ -82,6 +92,17 @@ const announceDeferredProps = (page: Page): void => {
   }
 }
 
+// The base tier's deferred props that are recorded but not yet requested, for the prop refresh state.
+const owedBaseDeferredProps = (page: Page): Page['deferredProps'] => {
+  const owed = pendingDeferred.get(undefined)
+
+  if (!owed || owed.component !== page.component || owed.url !== page.url) {
+    return undefined
+  }
+
+  return owed.deferredProps
+}
+
 const withLiveOwners = (page: Page, baseId: string): Page => {
   const open = new Set(layersOf(page).map((layer) => layer.id))
 
@@ -107,7 +128,10 @@ interface SetOptions {
   cached?: boolean
   initialRender?: boolean
   preservesBase?: boolean
+  clientSide?: boolean
   visitId?: string
+  isCancelled?: () => boolean
+  onCommit?: () => void
 }
 
 interface InstallOptions extends SetOptions {
@@ -148,7 +172,11 @@ class CurrentPage {
     resolveLoading,
     onFlash,
   }: RouterInitParams<ComponentType>) {
-    this.page = { ...initialPage, flash: initialPage.flash ?? {}, rescuedProps: initialPage.rescuedProps ?? [] }
+    // The initial visit loads the first page's deferred props once it renders
+    this.assignPage(
+      { ...initialPage, flash: initialPage.flash ?? {}, rescuedProps: initialPage.rescuedProps ?? [] },
+      initialPage.deferredProps,
+    )
     this.swapComponent = swapComponent
     this.resolveComponent = resolveComponent
     this.resolveLoading = resolveLoading
@@ -168,7 +196,7 @@ class CurrentPage {
     const before = new Set(previous.map((layer) => layer.id))
     const after = new Set(next.map((layer) => layer.id))
 
-    this.page = page
+    this.assignPage(page, owedBaseDeferredProps(page))
 
     const departed = previous.filter((layer) => !after.has(layer.id))
 
@@ -181,15 +209,31 @@ class CurrentPage {
     this.fireEventsFor('commit')
   }
 
+  /**
+   * Replace the whole page object and announce it. The partial mutations below
+   * deliberately do not, except `merge()`, which takes a `Partial<Page>` and is
+   * handed a whole page by `history.replaceState`.
+   */
+  protected assignPage(page: Page, pendingDeferredProps?: Page['deferredProps']): void {
+    this.page = page
+
+    setPendingDeferredProps(page.props, pendingDeferredProps)
+    eventHandler.fireInternalEvent('pageUpdated', page)
+  }
+
   public set(page: Page, options: SetOptions = {}): Promise<void> {
-    const { initialRender = false, preservesBase = false } = options
+    const { initialRender = false, preservesBase = false, isCancelled = () => false, onCommit = () => {} } = options
 
     if (Object.keys(page.deferredProps || {}).length && page.initialDeferredProps === undefined) {
       // Preserve original deferred props for back button handling
       page.initialDeferredProps = page.deferredProps
     }
 
+    const previousPendingDeferred = new Map(pendingDeferred)
+
     recordDeferredProps(page, initialRender ? undefined : this.page)
+
+    const recording = deferredRecording
 
     if (!preservesBase) {
       this.baseGeneration++
@@ -208,10 +252,18 @@ class CurrentPage {
     }
 
     return Promise.all([this.resolve(page.component, page), this.resolveLayers(page)]).then(([component, layers]) => {
-      if (componentId !== this.componentId) {
-        // Component has changed since we started resolving this component, bail
+      if (componentId !== this.componentId || isCancelled()) {
+        // A newer page may still load our deferred props, but those of a cancelled visit shouldn't outlive it
+        if (isCancelled() && deferredRecording === recording) {
+          pendingDeferred.clear()
+          previousPendingDeferred.forEach((owed, key) => pendingDeferred.set(key, owed))
+        }
+
+        // Component has changed or the visit was cancelled since we started resolving this component, bail
         return
       }
+
+      onCommit()
 
       return this.write(page, component, layers, options)
     })

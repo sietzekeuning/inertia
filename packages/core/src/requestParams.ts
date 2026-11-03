@@ -9,6 +9,7 @@ import {
   PreserveStateOption,
   VisitCallbacks,
 } from './types'
+import { isSameUrlWithoutHash, isSameUrlWithoutQueryOrHash } from './url'
 
 export class RequestParams {
   protected callbacks: {
@@ -88,6 +89,10 @@ export class RequestParams {
     return this.params.claims === true
   }
 
+  public isQueryMethodReload() {
+    return this.params.queryMethodReload === true
+  }
+
   public onCancelToken(cb: VoidFunction) {
     this.params.onCancelToken({
       cancel: cb,
@@ -110,6 +115,14 @@ export class RequestParams {
 
   public wasCancelledAtAll() {
     return this.params.cancelled || this.params.interrupted
+  }
+
+  /**
+   * A walk answers for the base under a cold layer and decides for itself whether it still lands (it checks the
+   * base generation), so a visit that interrupts it doesn't drop its response.
+   */
+  public isDropped() {
+    return this.wasCancelledAtAll() && !this.isWalkRequest()
   }
 
   public onFinish() {
@@ -212,5 +225,20 @@ export class RequestParams {
     }
 
     return value
+  }
+
+  /**
+   * Async visits run in the background, so only a sync visit to another URL leaves the page.
+   * Partial visits update the page they're on, so for those only another path counts.
+   * A full QUERY visit may carry a different body to the same URL, so it always leaves the page.
+   */
+  public leavesPage(pageUrl: URL, destinationUrl: URL): boolean {
+    if (this.params.async) {
+      return false
+    }
+
+    return this.isPartial()
+      ? !isSameUrlWithoutQueryOrHash(destinationUrl, pageUrl)
+      : this.params.method === 'query' || !isSameUrlWithoutHash(destinationUrl, pageUrl)
   }
 }

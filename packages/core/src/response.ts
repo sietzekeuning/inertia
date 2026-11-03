@@ -9,6 +9,7 @@ import {
   firePrefetchedEvent,
   fireSuccessEvent,
 } from './events'
+import { isFormData } from './formData'
 import { history } from './history'
 import { interceptors } from './interceptors'
 import { parsePage } from './json'
@@ -20,11 +21,12 @@ import { responseQueue } from './queue'
 import { RequestParams } from './requestParams'
 import { SessionStorage } from './sessionStorage'
 import { ActiveVisit, BaseSnapshot, ErrorBag, Errors, HttpResponse, LayerState, Page } from './types'
-import { hrefToUrl, isSameUrlWithoutHash, setHashIfSameUrl } from './url'
+import { hrefToUrl, isSameUrlWithoutHash, isSameUrlWithoutQueryOrHash, setHashIfSameUrl } from './url'
 
 export class Response {
   protected wasPrefetched = false
   protected processed = false
+  protected pageApplied = false
 
   constructor(
     protected requestParams: RequestParams,
@@ -49,7 +51,10 @@ export class Response {
   }
 
   public async handlePrefetch() {
-    if (isSameUrlWithoutHash(this.requestParams.all().url, window.location)) {
+    const { method, url } = this.requestParams.all()
+
+    // A QUERY prefetch may carry a different body than the current page, so it's only used once visited
+    if (method !== 'query' && isSameUrlWithoutHash(url, window.location)) {
       this.handle()
     }
   }
@@ -59,6 +64,9 @@ export class Response {
   }
 
   public async process() {
+    // A cached response is processed again for every visit that uses it
+    this.pageApplied = false
+
     if (this.requestParams.all().prefetch) {
       this.wasPrefetched = true
       this.requestParams.all().prefetch = false
@@ -71,6 +79,10 @@ export class Response {
 
     this.requestParams.runCallbacks()
     this.processed = true
+
+    if (this.requestParams.isDropped()) {
+      return
+    }
 
     if (!this.isInertiaResponse()) {
       return this.handleNonInertiaResponse()
@@ -117,45 +129,52 @@ export class Response {
 
     history.preserveUrl = this.requestParams.all().preserveUrl
 
-    const landedOn = await this.setPage()
+    try {
+      const landedOn = await this.setPage()
 
-    const page = currentPage.get()
-    const tier = landedOn === undefined ? page : layerAt(page, landedOn)
-    // A form inside a layer reads back its own tier, as its flash and errors already do.
-    const landedPage = landedOn === undefined || !tier ? page : layerPageOf(page, tier as LayerState)
-
-    if (tier) {
-      const { flash } = tier
-
-      if (Object.keys(flash).length > 0 && !this.requestParams.isDeferredPropsRequest()) {
-        fireFlashEvent(flash)
-        this.requestParams.all().onFlash(flash)
+      // A visit that's cancelled before its page is applied reports nothing, but once the page is shown it still does
+      if (this.requestParams.isDropped() && !this.pageApplied) {
+        return
       }
 
-      const errors = (tier.props.errors || {}) as Errors & ErrorBag
+      const page = currentPage.get()
+      const tier = landedOn === undefined ? page : layerAt(page, landedOn)
+      // A form inside a layer reads back its own tier, as its flash and errors already do.
+      const landedPage = landedOn === undefined || !tier ? page : layerPageOf(page, tier as LayerState)
 
-      if (Object.keys(errors).length > 0) {
-        const scopedErrors = this.getScopedErrors(errors)
+      if (tier) {
+        const { flash } = tier
 
-        fireErrorEvent(scopedErrors, { page: landedPage, stack: page, visitId: this.requestParams.all().id })
+        if (Object.keys(flash).length > 0 && !this.requestParams.isDeferredPropsRequest()) {
+          fireFlashEvent(flash)
+          this.requestParams.all().onFlash(flash)
+        }
 
-        return this.requestParams.all().onError(scopedErrors)
+        const errors = (tier.props.errors || {}) as Errors & ErrorBag
+
+        if (Object.keys(errors).length > 0) {
+          const scopedErrors = this.getScopedErrors(errors)
+
+          fireErrorEvent(scopedErrors, { page: landedPage, stack: page, visitId: this.requestParams.all().id })
+
+          return this.requestParams.all().onError(scopedErrors)
+        }
       }
+
+      router.flushByCacheTags(this.requestParams.all().invalidateCacheTags || [])
+
+      if (!this.wasPrefetched) {
+        // We end up here other than from the prefetch cache, so we assume this response is
+        // newer than the cached one and therefore flush the cache.
+        router.flush(tier?.url ?? page.url)
+      }
+
+      fireSuccessEvent(landedPage, { stack: page, visitId: this.requestParams.all().id })
+
+      await this.requestParams.all().onSuccess(landedPage)
+    } finally {
+      history.preserveUrl = false
     }
-
-    router.flushByCacheTags(this.requestParams.all().invalidateCacheTags || [])
-
-    if (!this.wasPrefetched) {
-      // We end up here other than from the prefetch cache, so we assume this response is
-      // newer than the cached one and therefore flush the cache.
-      router.flush(tier?.url ?? page.url)
-    }
-
-    fireSuccessEvent(landedPage, { stack: page, visitId: this.requestParams.all().id })
-
-    await this.requestParams.all().onSuccess(landedPage)
-
-    history.preserveUrl = false
   }
 
   public mergeParams(params: ActiveVisit) {
@@ -164,6 +183,12 @@ export class Response {
 
   public setCapturedBase(capturedBase: BaseSnapshot): void {
     this.capturedBase = capturedBase
+  }
+
+  public interrupt(): void {
+    if (!this.requestParams.wasCancelledAtAll()) {
+      this.requestParams.markAsCancelled({ cancelled: false, interrupted: true })
+    }
   }
 
   public getPageResponse(): Page {
@@ -290,7 +315,54 @@ export class Response {
 
     this.response = await interceptors.processResponse(this.requestParams.all(), this.response)
 
-    return landResponse(pageResponse, this.requestParams, this.capturedBase, this.optimisticId)
+    return landResponse(pageResponse, this.requestParams, this.capturedBase, this.optimisticId, {
+      keepsCurrentUrl: (currentPageUrl, responseUrl) => this.keepsCurrentUrl(currentPageUrl, responseUrl),
+      queryMethodData: (response) => this.queryMethodData(response),
+      onCommit: () => {
+        this.pageApplied = true
+      },
+    })
+  }
+
+  protected queryMethodData(pageResponse: Page): Page['queryMethodData'] {
+    const { method, data, url, preserveUrl, layerId } = this.requestParams.all()
+
+    // Redirects (e.g. after a failed validation) are followed with GET,
+    // so their pages don't carry the QUERY request data. Layers keep their own request.
+    const wasRenderedByQuery =
+      method === 'query' &&
+      layerId === undefined &&
+      !isFormData(data) &&
+      isSameUrlWithoutHash(hrefToUrl(pageResponse.url), url) &&
+      Object.keys(pageResponse.props.errors ?? {}).length === 0
+
+    if (!wasRenderedByQuery) {
+      return undefined
+    }
+
+    // Like reload data on a GET page, it becomes part of the page unless the URL is preserved (e.g. infinite scroll).
+    return this.requestParams.isQueryMethodReload() && preserveUrl ? currentPage.get().queryMethodData : data
+  }
+
+  /**
+   * A client visit, like the URL updates of <InfiniteScroll>, may change the query string while a reload of the
+   * page is in flight. The reload then keeps that URL instead of putting the previous query string back.
+   * Only the base page has such a URL; a layer's request is left alone.
+   */
+  protected keepsCurrentUrl(currentPageUrl: URL, responseUrl: URL): boolean {
+    const visit = this.requestParams.all()
+
+    if (!visit.async || visit.layerId !== undefined) {
+      return false
+    }
+
+    const originatingUrl = hrefToUrl(this.originatingPage.url)
+
+    const reloadsOriginatingPage = isSameUrlWithoutHash(visit.url, originatingUrl)
+    const urlChangedSince = !isSameUrlWithoutHash(currentPageUrl, originatingUrl)
+    const landsOnCurrentPath = isSameUrlWithoutQueryOrHash(responseUrl, currentPageUrl)
+
+    return reloadsOriginatingPage && urlChangedSince && landsOnCurrentPath
   }
 
   // Landing it would reopen what the user dismissed; an open carries no tier yet, so it is exempt.
